@@ -11,7 +11,7 @@ import tempfile
 import uvicorn
 from typing import Dict, Any
 import warnings
-from speechbrain.inference.ASR import EncoderDecoderASR
+
 
 
 app = FastAPI(
@@ -163,13 +163,6 @@ def classify_video_internal(video_path):
 
 
 
-def audio_to_text(audio_path):
-    warnings.filterwarnings("ignore", category=FutureWarning)
-    asr_model = EncoderDecoderASR.from_hparams(source="speechbrain/asr-crdnn-switchboard", savedir="pretrained_models/speechbrain/asr-crdnn-switchboard")
-    text = asr_model.transcribe_file(audio_path)
-    return text
-
-
 
 @app.get("/")
 async def root():
@@ -196,35 +189,6 @@ async def classify_image_endpoint(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
 
-@app.post("/classify/text", response_model=SafetyResponse)
-async def classify_text_endpoint(request: TextRequest):
-    try:
-        result = classify_text_internal(request.text)
-        return SafetyResponse(**result)
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing text: {str(e)}")
-
-
-@app.post("/classify/audio/", response_model=SafetyResponse)
-async def classify_audio_endpoint(file: UploadFile = File(...)):
-    try:
-        if not file.content_type.startswith("audio/"):
-            raise HTTPException(status_code=400, detail="File must be an audio")
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
-            contents = await file.read()
-            temp_file.write(contents)
-            temp_file.flush()
-            
-            text = audio_to_text(temp_file.name)
-            
-            os.unlink(temp_file.name)
-
-            result = classify_text_internal(text)
-            
-            return SafetyResponse(**result)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing audio: {str(e)}")
 
 @app.post("/classify/video", response_model=SafetyResponse)
 async def classify_video_endpoint(file: UploadFile = File(...)):
