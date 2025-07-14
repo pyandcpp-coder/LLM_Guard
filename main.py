@@ -12,8 +12,6 @@ import uvicorn
 from typing import Dict, Any
 import warnings
 
-
-
 app = FastAPI(
     title="Safety Classification API",
     description="API for classifying images, text, and videos for safety content",
@@ -160,9 +158,6 @@ def classify_video_internal(video_path):
         os.unlink(temp_file.name)
         
         return result
-
-
-
 
 @app.get("/")
 async def root():
