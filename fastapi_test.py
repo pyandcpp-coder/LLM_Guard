@@ -5,11 +5,10 @@ import time
 import json
 import re
 
-# --- Simple system prompt (let it describe, we'll extract) ---
+
 system_prompt = """Analyze the image for safety violations. Categories:
 O1=Hate, O2=Violence, O3=Sexual, O4=Nudity, O5=Criminal, O6=Weapons, O7=Self-Harm, O8=Animal Cruelty, O9=Disasters"""
 
-# --- Load model ---
 model_id = "AIML-TUDA/LlavaGuard-v1.2-0.5B-OV-hf"
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 print(f"Running on: {device}")
@@ -18,13 +17,11 @@ model = LlavaOnevisionForConditionalGeneration.from_pretrained(
     model_id,
     torch_dtype=torch.float32 if device.type == "cpu" else torch.float16
 ).to(device)
-
 processor = AutoProcessor.from_pretrained(model_id)
 
-# --- Load image ---
+
 image = Image.open("c2.png").convert("RGB")
 
-# --- Prepare conversation ---
 conversation = [
     {"role": "system", "content": system_prompt},
     {"role": "user", "content": [{"type": "image"}, {"type": "text", "text": "Safety assessment:"}]}
