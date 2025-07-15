@@ -1,21 +1,29 @@
+import os
+import io
+import cv2
+import torch
+import tempfile
+import requests
+from PIL import Image
+from io import BytesIO
+from typing import Dict, Any
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from transformers import AutoProcessor, LlavaOnevisionForConditionalGeneration, pipeline
-from PIL import Image
-import torch
-import cv2
-import io
-import os
-import tempfile
+from pydantic import BaseModel, HttpUrl
+from transformers import (
+    AutoProcessor,
+    LlavaOnevisionForConditionalGeneration,
+    pipeline,
+    AutoImageProcessor,
+    AutoModelForImageClassification
+)
 import uvicorn
-from typing import Dict, Any
-import warnings
 
+# ---------- FastAPI Setup ----------
 app = FastAPI(
-    title="Safety Classification API",
-    description="API for classifying images, text, and videos for safety content",
-    version="1.0.0"
+    title="Unified Safety Classification API",
+    description="NSFW + Harmful Content Classification using Transformers & LLMs",
+    version="3.0.0"
 )
 
 app.add_middleware(
@@ -26,14 +34,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-class TextRequest(BaseModel):
-    text: str
-
-class SafetyResponse(BaseModel):
-    rating: str
-    category: str
-    explanation: str
-
+# ---------- Models and Configs ----------
 device = torch.device("cpu")
 
 CATEGORIES = {
@@ -48,8 +49,6 @@ CATEGORIES = {
     "O9: Disasters or Emergencies": "Disasters or emergencies",
     "NA: None applying": "Safe content"
 }
-CATEGORY_LIST = list(CATEGORIES.keys())
-CATEGORY_DESC = list(CATEGORIES.values())
 
 generation_args = {
     "max_new_tokens": 100,
@@ -64,10 +63,26 @@ generation_args = {
 llava_model = None
 llava_processor = None
 classifier = None
+nsfw_processor = None
+nsfw_model = None
 
+# ---------- Response Models ----------
+class SafetyResponse(BaseModel):
+    rating: str
+    category: str
+    explanation: str
+    nsfw_prediction: str
+    nsfw_confidence: float
+
+class TextRequest(BaseModel):
+    text: str
+
+# ---------- Startup Event ----------
+@app.on_event("startup")
 def load_models():
-    global llava_model, llava_processor, classifier
-    
+    global llava_model, llava_processor, classifier, nsfw_model, nsfw_processor
+
+    # Load LLaVA model
     print("Loading LLavaGuard model...")
     llava_model_id = "AIML-TUDA/LlavaGuard-v1.2-0.5B-OV-hf"
     llava_model = LlavaOnevisionForConditionalGeneration.from_pretrained(
@@ -75,16 +90,31 @@ def load_models():
         torch_dtype=torch.float32
     ).to(device)
     llava_processor = AutoProcessor.from_pretrained(llava_model_id)
-    
-    print("Loading zero-shot classification model...")
+
+    # Load zero-shot classifier
+    print("Loading BART classifier...")
     classifier = pipeline(
         "zero-shot-classification",
         model="facebook/bart-large-mnli",
         device=-1
     )
-    
-    print("Models loaded successfully!")
 
+    # Load NSFW classifier
+    print("Loading NSFW model...")
+    nsfw_processor = AutoImageProcessor.from_pretrained("Falconsai/nsfw_image_detection")
+    nsfw_model = AutoModelForImageClassification.from_pretrained("Falconsai/nsfw_image_detection")
+
+# ---------- NSFW Prediction ----------
+def predict_nsfw(image: Image.Image):
+    inputs = nsfw_processor(images=image, return_tensors="pt")
+    outputs = nsfw_model(**inputs)
+    logits = outputs.logits
+    predicted_class_idx = logits.argmax(-1).item()
+    label = nsfw_model.config.id2label[predicted_class_idx]
+    confidence = logits.softmax(-1)[0][predicted_class_idx].item()
+    return label, confidence
+
+# ---------- LLM Classification ----------
 def get_llava_output(image, text=""):
     prompt = "Describe any potential harmful content in the image/text. Do not assume."
     conversation = [{
@@ -97,131 +127,88 @@ def get_llava_output(image, text=""):
     prompt_text = llava_processor.apply_chat_template(conversation, add_generation_prompt=True)
     inputs = llava_processor(text=prompt_text, images=image, return_tensors="pt")
     inputs = {k: v.to(device) for k, v in inputs.items()}
-
     with torch.no_grad():
         output = llava_model.generate(**inputs, **generation_args)
-
     return llava_processor.decode(output[0], skip_special_tokens=True).strip()
 
-def classify_safety(explanation):
-    result = classifier(explanation, CATEGORY_DESC, multi_label=True)
-    
-    scores = result["scores"]
-    labels = result["labels"]
-
-    desc_to_key = {v: k for k, v in CATEGORIES.items()}
-    
+def classify_safety(explanation: str) -> Dict[str, Any]:
+    result = classifier(explanation, list(CATEGORIES.values()), multi_label=True)
     best_score = 0
     best_category = "NA: None applying"
-    
-    for label, score in zip(labels, scores):
-        if label in desc_to_key:
-            if label == "Safe content":
+    for label, score in zip(result["labels"], result["scores"]):
+        if label == "Safe content" and score > 0.6:
+            return {"rating": "Safe", "category": "NA: None applying", "explanation": explanation}
+        elif score > best_score and score > 0.4:
+            best_score = score
+            best_category = next((k for k, v in CATEGORIES.items() if v == label), "NA: None applying")
+    return {
+        "rating": "Unsafe" if best_category != "NA: None applying" else "Safe",
+        "category": best_category,
+        "explanation": explanation
+    }
 
-                if score > 0.6:
-                    return {"rating": "Safe", "category": "NA: None applying", "explanation": explanation}
-            else:
-
-                if score > best_score and score > 0.4:
-                    best_score = score
-                    best_category = desc_to_key[label]
-    
-
-    if best_category != "NA: None applying" and best_score > 0.4:
-        return {"rating": "Unsafe", "category": best_category, "explanation": explanation}
-    else:
-        return {"rating": "Safe", "category": "NA: None applying", "explanation": explanation}
-
-def classify_image_internal(image):
+# ---------- Image Classification ----------
+def classify_image_internal(image: Image.Image):
     explanation = get_llava_output(image)
-    return classify_safety(explanation)
+    safety = classify_safety(explanation)
+    nsfw_pred, nsfw_conf = predict_nsfw(image)
+    safety.update({
+        "nsfw_prediction": nsfw_pred,
+        "nsfw_confidence": nsfw_conf
+    })
+    return safety
 
-def classify_text_internal(text):
-    dummy = Image.new("RGB", (224, 224), color=(255, 255, 255))
-    explanation = get_llava_output(dummy, text)
-    return classify_safety(explanation)
-
-def classify_video_internal(video_path):
-    cap = cv2.VideoCapture(video_path)
-    success, frame = cap.read()
-    if not success:
-        return {"rating": "Error", "category": "Video Failed", "explanation": "Could not read frame"}
-    
-    with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as temp_file:
-        cv2.imwrite(temp_file.name, frame)
-        cap.release()
-        
-
-        pil_image = Image.open(temp_file.name).convert("RGB")
-        result = classify_image_internal(pil_image)
-        
-        os.unlink(temp_file.name)
-        
-        return result
-
+# ---------- Endpoints ----------
 @app.get("/")
-async def root():
-    return {"message": "Safety Classification API", "status": "running"}
+def root():
+    return {"message": "Unified NSFW + Safety API is running"}
 
 @app.get("/health")
-async def health_check():
-    return {"status": "healthy", "models_loaded": llava_model is not None and classifier is not None}
-
-    
-@app.post("/classify/image", response_model=SafetyResponse)
-async def classify_image_endpoint(file: UploadFile = File(...)):
-    try:
-        if not file.content_type.startswith("image/"):
-            raise HTTPException(status_code=400, detail="File must be an image")
-        
-        contents = await file.read()
-        image = Image.open(io.BytesIO(contents)).convert("RGB")
-        
-        result = classify_image_internal(image)
-        
-        return SafetyResponse(**result)
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing image: {str(e)}")
-
-
-@app.post("/classify/video", response_model=SafetyResponse)
-async def classify_video_endpoint(file: UploadFile = File(...)):
-    try:
-        if not file.content_type.startswith("video/"):
-            raise HTTPException(status_code=400, detail="File must be a video")
-        
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as temp_file:
-            contents = await file.read()
-            temp_file.write(contents)
-            temp_file.flush()
-            
-            result = classify_video_internal(temp_file.name)
-            
-            os.unlink(temp_file.name)
-            
-            return SafetyResponse(**result)
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error processing video: {str(e)}")
+def health_check():
+    return {"status": "healthy", "models_loaded": all([llava_model, classifier, nsfw_model])}
 
 @app.get("/categories")
-async def get_categories():
+def get_categories():
     return {"categories": CATEGORIES}
 
-@app.on_event("startup")
-async def startup_event():
-    load_models()
+@app.post("/classify/image", response_model=SafetyResponse)
+async def classify_image(file: UploadFile = File(...)):
+    if not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Only image files are supported.")
+    contents = await file.read()
+    try:
+        image = Image.open(io.BytesIO(contents)).convert("RGB")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid image.")
+    result = classify_image_internal(image)
+    return SafetyResponse(**result)
 
+@app.post("/classify/text", response_model=SafetyResponse)
+async def classify_text(text_req: TextRequest):
+    dummy_image = Image.new("RGB", (224, 224), color=(255, 255, 255))
+    explanation = get_llava_output(dummy_image, text_req.text)
+    result = classify_safety(explanation)
+    result.update({"nsfw_prediction": "sfw", "nsfw_confidence": 0.0})  # text input assumed SFW
+    return SafetyResponse(**result)
 
+@app.post("/classify/video", response_model=SafetyResponse)
+async def classify_video(file: UploadFile = File(...)):
+    if not file.content_type.startswith("video/"):
+        raise HTTPException(status_code=400, detail="Only video files are supported.")
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+        contents = await file.read()
+        tmp.write(contents)
+        tmp.flush()
+        cap = cv2.VideoCapture(tmp.name)
+        success, frame = cap.read()
+        cap.release()
+        if not success:
+            raise HTTPException(status_code=500, detail="Failed to read video frame.")
+        pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+        result = classify_image_internal(pil_image)
+        os.unlink(tmp.name)
+        return SafetyResponse(**result)
 
-
-
+# ---------- Run App ----------
 if __name__ == "__main__":
-    uvicorn.run(
-        "main:app",  
-        host="0.0.0.0",
-        port=8002,
-        reload=True
-    )
-
+    uvicorn.run("main:app", host="0.0.0.0", port=8020, reload=True)
