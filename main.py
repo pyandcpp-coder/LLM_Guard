@@ -19,7 +19,7 @@ from transformers import (
 )
 import uvicorn
 
-# ---------- FastAPI Setup ----------
+
 app = FastAPI(
     title="Unified Safety Classification API",
     description="NSFW + Harmful Content Classification using Transformers & LLMs",
@@ -33,9 +33,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# ---------- Models and Configs ----------
-device = torch.device("cpu")
+# device = torch.device("cpu")
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 CATEGORIES = {
     "O1: Hate, Humiliation, Harassment": "Hate, harassment, or humiliation",
@@ -66,7 +65,6 @@ classifier = None
 nsfw_processor = None
 nsfw_model = None
 
-# ---------- Response Models ----------
 class SafetyResponse(BaseModel):
     rating: str
     category: str
@@ -77,44 +75,61 @@ class SafetyResponse(BaseModel):
 class TextRequest(BaseModel):
     text: str
 
-# ---------- Startup Event ----------
 @app.on_event("startup")
 def load_models():
     global llava_model, llava_processor, classifier, nsfw_model, nsfw_processor
 
-    # Load LLaVA model
     print("Loading LLavaGuard model...")
     llava_model_id = "AIML-TUDA/LlavaGuard-v1.2-0.5B-OV-hf"
+    # llava_model = LlavaOnevisionForConditionalGeneration.from_pretrained(
+    #     llava_model_id,
+    #     torch_dtype=torch.float32
+    # ).to(device)
     llava_model = LlavaOnevisionForConditionalGeneration.from_pretrained(
-        llava_model_id,
-        torch_dtype=torch.float32
+    llava_model_id,
+    torch_dtype=torch.float16 if device.type == "cuda" else torch.float32
     ).to(device)
+
     llava_processor = AutoProcessor.from_pretrained(llava_model_id)
 
-    # Load zero-shot classifier
     print("Loading BART classifier...")
+    # classifier = pipeline(
+    #     "zero-shot-classification",
+    #     model="facebook/bart-large-mnli",
+    #     device=-1
+    # )
     classifier = pipeline(
-        "zero-shot-classification",
-        model="facebook/bart-large-mnli",
-        device=-1
+    "zero-shot-classification",
+    model="facebook/bart-large-mnli",
+    device=0 if device.type == "cuda" else -1
     )
-
-    # Load NSFW classifier
     print("Loading NSFW model...")
+    # nsfw_processor = AutoImageProcessor.from_pretrained("Falconsai/nsfw_image_detection")
+    # nsfw_model = AutoModelForImageClassification.from_pretrained("Falconsai/nsfw_image_detection")
     nsfw_processor = AutoImageProcessor.from_pretrained("Falconsai/nsfw_image_detection")
-    nsfw_model = AutoModelForImageClassification.from_pretrained("Falconsai/nsfw_image_detection")
+    nsfw_model = AutoModelForImageClassification.from_pretrained("Falconsai/nsfw_image_detection").to(device)
 
-# ---------- NSFW Prediction ----------
+# def predict_nsfw(image: Image.Image):
+#     inputs = nsfw_processor(images=image, return_tensors="pt")
+#     outputs = nsfw_model(**inputs)
+#     logits = outputs.logits
+#     predicted_class_idx = logits.argmax(-1).item()
+#     label = nsfw_model.config.id2label[predicted_class_idx]
+#     confidence = logits.softmax(-1)[0][predicted_class_idx].item()
+#     return label, confidence
+
 def predict_nsfw(image: Image.Image):
     inputs = nsfw_processor(images=image, return_tensors="pt")
-    outputs = nsfw_model(**inputs)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    with torch.no_grad():
+        outputs = nsfw_model(**inputs)
     logits = outputs.logits
     predicted_class_idx = logits.argmax(-1).item()
     label = nsfw_model.config.id2label[predicted_class_idx]
     confidence = logits.softmax(-1)[0][predicted_class_idx].item()
     return label, confidence
 
-# ---------- LLM Classification ----------
+
 def get_llava_output(image, text=""):
     prompt = "Describe any potential harmful content in the image/text. Do not assume."
     conversation = [{
@@ -147,7 +162,6 @@ def classify_safety(explanation: str) -> Dict[str, Any]:
         "explanation": explanation
     }
 
-# ---------- Image Classification ----------
 def classify_image_internal(image: Image.Image):
     explanation = get_llava_output(image)
     safety = classify_safety(explanation)
@@ -158,7 +172,6 @@ def classify_image_internal(image: Image.Image):
     })
     return safety
 
-# ---------- Endpoints ----------
 @app.get("/")
 def root():
     return {"message": "Unified NSFW + Safety API is running"}
@@ -188,7 +201,7 @@ async def classify_text(text_req: TextRequest):
     dummy_image = Image.new("RGB", (224, 224), color=(255, 255, 255))
     explanation = get_llava_output(dummy_image, text_req.text)
     result = classify_safety(explanation)
-    result.update({"nsfw_prediction": "sfw", "nsfw_confidence": 0.0})  # text input assumed SFW
+    result.update({"nsfw_prediction": "sfw", "nsfw_confidence": 0.0})  
     return SafetyResponse(**result)
 
 @app.post("/classify/video", response_model=SafetyResponse)
@@ -209,6 +222,6 @@ async def classify_video(file: UploadFile = File(...)):
         os.unlink(tmp.name)
         return SafetyResponse(**result)
 
-# ---------- Run App ----------
+
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8020, reload=True)
