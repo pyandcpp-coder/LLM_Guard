@@ -74,6 +74,12 @@ class SafetyResponse(BaseModel):
 class TextRequest(BaseModel):
     text: str
 
+def format_category(category: str) -> str:
+    """Convert category from 'O1' format to '1' format, or keep 'NA' as is."""
+    if category.startswith("O") and len(category) == 2 and category[1].isdigit():
+        return category[1]
+    return category
+
 @app.on_event("startup")
 def load_models():
     global llava_model, llava_processor, classifier, nsfw_model, nsfw_processor
@@ -135,18 +141,18 @@ def classify_safety(explanation: str) -> Dict[str, Any]:
             return {"rating": "safe", "category": "NA"}
         elif score > best_score and score > 0.4:
             best_score = score
-            # Extract category number from the key
+            # Extract category key from the label
             for key, value in CATEGORIES.items():
                 if value == label:
-                    if key.startswith("O"):
-                        best_category = key[1]  # Extract number after "O"
-                    else:
-                        best_category = "NA"
+                    best_category = key.split(":")[0]  # Get "O1", "O2", etc.
                     break
     
+    # Format the category before returning
+    formatted_category = format_category(best_category)
+    
     return {
-        "rating": "unsafe" if best_category != "NA" else "safe",
-        "category": best_category
+        "rating": "unsafe" if formatted_category != "NA" else "safe",
+        "category": formatted_category
     }
 
 def classify_image_internal(image: Image.Image):
@@ -164,12 +170,26 @@ def health_check():
 
 @app.get("/categories")
 def get_categories():
-    return {"categories": CATEGORIES}
+    # Return categories with simplified format
+    simplified_categories = {}
+    for key, value in CATEGORIES.items():
+        if key.startswith("O"):
+            simplified_key = key[1]  # Extract just the number
+            simplified_categories[simplified_key] = value
+        else:
+            simplified_categories["NA"] = value
+    return {"categories": simplified_categories}
 
 @app.post("/classify/image", response_model=SafetyResponse)
 async def classify_image_url(req: URLRequest):
     try:
-        response = requests.get(req.url)
+        headers = {
+            
+
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/115.0.0.0 Safari/537.36"
+
+        }
+        response = requests.get(req.url,headers=headers)
         response.raise_for_status()
         image = Image.open(io.BytesIO(response.content)).convert("RGB")
     except Exception as e:
